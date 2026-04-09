@@ -259,15 +259,30 @@ def plan_task(user_input: str, messages: List[Dict]) -> tuple:
         "role": "system",
         "content": """You are a task planner for a Windows OS assistant.
 
-Break the task into steps using available tools.
+Break the task into steps using ONLY these exact tool names:
+  create_folder(path)
+  create_file(path, content)
+  delete_file(path)
+  list_directory(path)
+  read_file(path)
+  search_files(root, pattern)
+  run_powershell(command)
+  get_system_info(query)
+  web_search(query)
+  create_shortcut(target, shortcut)
+  run_as_admin(path)
+  uninstall_program(name)
 
-Return JSON ONLY:
-{"steps":[{"tool":"tool_name","args":{}}]}
+Return JSON ONLY in this exact format:
+{"steps":[{"tool":"create_folder","args":{"path":"C:\\Users\\user\\Desktop\\myfolder"}}]}
 
 If no tools needed, return:
 {"steps":[]}
 
-Focus only on the current task. Ignore previous conversation context.
+Rules:
+- Use ONLY the tool names listed above
+- Always use full absolute Windows paths
+- No text outside the JSON
 """
     }
 
@@ -276,9 +291,16 @@ Focus only on the current task. Ignore previous conversation context.
 
     # Parse planner response directly - it returns {"steps":[...]} not a tool call
     response = response.strip()
+
+    # Guard: if AI call failed entirely, report clearly
+    if response.startswith("[Error]") or response == "[Cancelled]":
+        print(f"  [Planner Error] AI call failed: {response}")
+        return [], False
+
     # Strip markdown code fences if present
     if "```" in response:
         response = re.sub(r"```(?:json)?", "", response).replace("```", "").strip()
+
     # Find the JSON block
     try:
         start = response.index("{")
@@ -288,10 +310,13 @@ Focus only on the current task. Ignore previous conversation context.
         tool_data = json.loads(raw)
         if isinstance(tool_data, dict) and "steps" in tool_data and isinstance(tool_data["steps"], list):
             return tool_data["steps"], True
-    except Exception:
-        pass
+        # Model returned valid JSON but wrong format - print it to help debug
+        print(f"  [Planner Error] Unexpected JSON structure: {list(tool_data.keys())}")
+    except json.JSONDecodeError as e:
+        print(f"  [Planner Error] JSON decode failed: {e}")
+    except ValueError:
+        print(f"  [Planner Error] No JSON found in response: {response[:100]}")
 
-    print("  [Planner Error] Could not parse steps")
     return [], False
 
 
