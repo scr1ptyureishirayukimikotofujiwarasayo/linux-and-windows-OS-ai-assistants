@@ -208,6 +208,15 @@ def extract_json(text):
                         logger.error(f"JSON parsing error: {e}")
                         logger.debug(f"Cleaned JSON: {json_str[:200]}")
                         return None
+    
+    # Fallback: regex search for first balanced braces
+    brace_re = re.compile(r'(\{.*\})', re.DOTALL)
+    match = brace_re.search(text)
+    if match:
+        try:
+            return json.loads(match.group(1))
+        except:
+            pass
     return None
 
 # ================= BACKENDS =================
@@ -322,61 +331,42 @@ def build_planner_prompt(task, task_memory):
         {
             "role": "system",
             "content": (
-                "You are a Linux task planner working iteratively.\n"
-                "You ONLY output JSON for each step.\n"
-                "The agent will execute your command and return to you for the next step.\n\n"
-
-                "System:\n"
+                "You are a Linux task planner. You work iteratively - one step at a time.\n"
+                "Output ONLY a JSON object with these fields:\n"
+                "{\n"
+                "  \"thought\": \"brief reasoning about the current state\",\n"
+                "  \"action\": \"run_terminal\" or \"finish\",\n"
+                "  \"command\": \"the exact command to run (if action is run_terminal)\"\n"
+                "}\n\n"
+                "System information:\n"
                 f"{json.dumps(SYS_INFO, indent=2)}\n\n"
-
-                "Recent memory:\n"
+                "Recent memory (previous steps of this task):\n"
                 f"{json.dumps(task_memory, indent=2)}\n\n"
-
-                "Break the task into ONE step at a time.\n"
-                "The agent will execute each step and continue until the task is complete.\n\n"
-
-                "IMPORTANT: Always use absolute paths. Never rely on current working directory.\n\n"
-
-                "Actions:\n"
-                "- run_terminal\n"
-                "- finish\n\n"
-
-                "Format:\n"
-                '{ "action": "...", "command": "...", "reason": "..."}\n\n'
-
-                "Rules:\n"
-                "- No text outside JSON\n"
-                "- Understand relative paths like 'desktop', 'downloads', 'documents'\n"
-                "- Use absolute paths when possible\n"
-                "- One step only\n"
-                "- Always output ONE valid command\n"
-                "- NEVER include multiple paths in mkdir\n"
-                "- ABSOLUTELY FORBIDDEN: pipes (|), redirections (> <), chaining (; && ||). \n"
-                "  If you use them, the command will be rejected and you will be forced to retry.\n"
-                "- NEVER use interactive commands (vim, nano, less, top, etc.)\n"
-                "- NEVER use cd commands - use absolute paths only\n"
-                "- ALWAYS output valid JSON only\n"
-                "- If task is complete -> action=finish\n\n"
-                
-                "Examples of CORRECT commands:\n"
-                "- To check if a package is installed: dpkg -l package_name\n"
-                "- To check if Chrome is installed: dpkg -l google-chrome-stable\n"
-                "- To list installed packages: apt list --installed package_name\n"
-                "- To check package info: apt show package_name\n\n"
-                
-                "Examples of WRONG commands (will be rejected):\n"
-                "- dpkg -l | grep package   # WRONG - pipe not allowed\n"
-                "- apt list --installed | grep chrome   # WRONG - pipe not allowed\n"
-                "- ls -la && cat file.txt   # WRONG - chaining not allowed\n"
+                "STRICT RULES:\n"
+                "1. Always use absolute paths - never 'cd'.\n"
+                "2. Forbidden characters/operators: | ; && || > < & ` $()\n"
+                "3. Forbidden commands: cd, vim, nano, less, top, htop, sudo (the agent handles sudo)\n"
+                "4. For `mkdir` always use `-p` flag.\n"
+                "5. For `rm` always use `-i` flag or ask for confirmation.\n"
+                "6. To check if a package is installed, use `dpkg -l PACKAGE` (Debian/Ubuntu) or `rpm -q PACKAGE` (RHEL).\n"
+                "7. To install a package, first check if it exists: `apt-cache show PACKAGE`.\n"
+                "8. If a command fails, try a different approach in the next step - do not repeat the same failing command.\n"
+                "9. When the original user task is fully completed, set action to 'finish'.\n\n"
+                "CORRECT examples:\n"
+                "- {\"thought\": \"Chrome not installed, check if package exists\", \"action\": \"run_terminal\", \"command\": \"apt-cache show google-chrome-stable\"}\n"
+                "- {\"thought\": \"Package exists, install it\", \"action\": \"run_terminal\", \"command\": \"sudo apt-get install -y google-chrome-stable\"}\n"
+                "- {\"thought\": \"All steps done\", \"action\": \"finish\", \"command\": \"\"}\n\n"
+                "INCORRECT examples (will be rejected):\n"
+                "- {\"command\": \"dpkg -l | grep chrome\"}   # pipe not allowed\n"
+                "- {\"command\": \"cd /tmp && ls\"}          # cd and chaining\n"
+                "- {\"command\": \"sudo rm -rf /home/user\"} # dangerous pattern\n"
+                "- {\"command\": \"vim file.txt\"}           # interactive\n\n"
+                "Now produce exactly one JSON object for the next step."
             )
         },
         {
             "role": "user",
-            "content": (
-                f"Task: {task}\n\n"
-                f"If the most recent memory entry shows an ERROR result, "
-                f"you MUST try a completely different command to accomplish the same goal."
-            )
+            "content": f"Task: {task}\nIf the last memory entry shows an ERROR, you must try a different command."
         }
     ]
 
@@ -491,11 +481,11 @@ def confirm_execution(command):
     return response in ['y', 'yes']
 
 def validate_command(command, error=None):
-    """Ask AI to validate and fix command with retry logic"""
+    """Ask AI to suggest a completely different command to achieve the same goal."""
     for attempt in range(3):  # Max 3 attempts
         messages = [
-            {"role": "system", "content": "You are a Linux command expert. Fix the invalid command and return ONLY JSON: {\"command\": \"fixed_command\"}"},
-            {"role": "user", "content": f"Command: {command}\nError: {error or 'None'}\n\nReturn fixed command as JSON only."}
+            {"role": "system", "content": "You are a Linux expert. The user's command failed. Suggest a completely different command to accomplish the same goal. Output ONLY JSON: {\"command\": \"new_command\"}"},
+            {"role": "user", "content": f"Original command: {command}\nError: {error}\nReturn a different working command as JSON only."}
         ]
         
         response = ask_ai(messages)
@@ -530,6 +520,56 @@ def clean_command(command):
         return " ".join(parts)
     return command
 
+# ================= PRE-EXECUTION VALIDATION =================
+
+def command_binary_exists(command_parts):
+    """Check if the first word of the command is an executable in PATH."""
+    if not command_parts:
+        return False
+    binary = command_parts[0]
+    if binary.startswith(('sudo', 'time', 'nice')) and len(command_parts) > 1:
+        binary = command_parts[1]
+    from shutil import which
+    return which(binary) is not None
+
+def package_available(pkg_name):
+    """Check if a package exists in the repositories (Debian/Ubuntu)."""
+    try:
+        r = subprocess.run(['apt-cache', 'show', pkg_name],
+                           capture_output=True, text=True, timeout=10)
+        return r.returncode == 0
+    except:
+        return False
+
+def is_path_safe(path_str):
+    """Prevent deletion of critical system directories."""
+    dangerous_paths = ['/', '/usr', '/etc', '/var', '/boot', '/bin', '/sbin', '/lib', '/root']
+    expanded = os.path.abspath(os.path.expanduser(path_str))
+    for bad in dangerous_paths:
+        if expanded == bad or expanded.startswith(bad + '/'):
+            return False
+    return True
+
+def validate_command_safety(command_parts):
+    """Extra safety checks beyond the existing is_dangerous_command."""
+    if not command_parts:
+        return True, "Empty command"
+    # Check for rm with unsafe paths
+    if command_parts[0] == 'rm' and '-rf' in command_parts:
+        for i, arg in enumerate(command_parts):
+            if arg in ('-rf', '-r', '-f') and i+1 < len(command_parts):
+                target = command_parts[i+1]
+                if not is_path_safe(target):
+                    return False, f"Unsafe rm target: {target}"
+    # Check for recursive chmod on system directories
+    if command_parts[0] == 'chmod' and '-R' in command_parts:
+        for i, arg in enumerate(command_parts):
+            if arg == '-R' and i+1 < len(command_parts):
+                target = command_parts[i+1]
+                if not is_path_safe(target):
+                    return False, f"Unsafe chmod target: {target}"
+    return True, "OK"
+
 # ================= EXECUTOR =================
 
 def execute(command):
@@ -542,7 +582,31 @@ def execute(command):
         command_parts = parse_command(processed)
         if not command_parts:
             return "ERROR: Failed to parse command"
-        
+
+        # ---- NEW PRE-CHECKS ----
+        # 1. Check if binary exists (for non-sudo commands)
+        if command_parts[0] != 'sudo':
+            if not command_binary_exists(command_parts):
+                return f"ERROR: Command '{command_parts[0]}' not found in PATH. Install it first or use a different command."
+        else:
+            # for sudo commands, check the real binary
+            if len(command_parts) > 1 and not command_binary_exists(command_parts[1:]):
+                return f"ERROR: Sudo command '{command_parts[1]}' not found in PATH."
+
+        # 2. Extra safety check for rm/chmod
+        safe, msg = validate_command_safety(command_parts)
+        if not safe:
+            return f"ERROR: {msg}"
+
+        # 3. If the command is 'apt-get install' and we are not in dry-run, pre-check package existence
+        if command_parts[0] == 'sudo' and len(command_parts) > 2 and command_parts[1] in ('apt-get', 'apt'):
+            if command_parts[2] == 'install':
+                pkg_name = command_parts[3] if len(command_parts) > 3 else None
+                if pkg_name and not package_available(pkg_name):
+                    return f"ERROR: Package '{pkg_name}' not found in repositories. Aborting install."
+
+        # ---- END OF NEW CHECKS ----
+
         # Check for cd commands
         if command_parts[0] == 'cd':
             return "ERROR: 'cd' command not supported. Use absolute paths instead."
@@ -585,10 +649,11 @@ def execute(command):
                 if r.returncode == 0:
                     return r.stdout.strip() or "SUCCESS"
                 else:
-                    # If password was wrong, clear cached password and retry once
+                    # If password was wrong, clear cached password and retry same command
                     if "incorrect password" in r.stderr.lower():
                         clear_sudo_password()
-                        return "ERROR: Incorrect sudo password. Please try again."
+                        # Retry same command with new password (not counted as attempt)
+                        continue  # go to next iteration of the outer for attempt loop
                     return f"ERROR: {r.stderr.strip()}"
             except subprocess.TimeoutExpired:
                 return "ERROR: Sudo command timed out"
@@ -693,6 +758,22 @@ def run_agent(task):
 
         result = execute(command)
 
+        # Post-execution verification
+        if not result.startswith("ERROR"):
+            verify_messages = [
+                {"role": "system", "content": "You are a verifier. Determine if the last command made progress toward the original task. Output JSON: {\"progress\": true/false, \"reason\": \"...\", \"next_command\": \"optional command to retry\"}"},
+                {"role": "user", "content": f"Task: {task}\nLast command: {command}\nOutput: {result}\nDid it make progress? If not, suggest a single alternative command."}
+            ]
+            verify_response = ask_ai(verify_messages)
+            verify_data = extract_json(verify_response)
+            if verify_data and verify_data.get("progress") is False:
+                # No progress - retry with the suggested alternative
+                alt_cmd = verify_data.get("next_command")
+                if alt_cmd:
+                    logger.warning(f"No progress, retrying with: {alt_cmd}")
+                    result = execute(alt_cmd)
+                    command = alt_cmd  # Update command for memory
+
         logger.info(f"[Step {step}] {command}")
         logger.info(f"Result: {result}")
 
@@ -762,6 +843,9 @@ EXAMPLES:
     # Safety settings
     auto_confirm = input("Auto-execute commands? (y/N): ").strip().lower()
     config.auto_execute = auto_confirm in ['y', 'yes']
+    # Enforce safe default
+    if config.auto_execute:
+        print("Auto-execute is risky. Consider using --dry-run first.")
     
     # Step limit
     steps_input = input(f"Max steps (default {config.max_steps}): ").strip()
