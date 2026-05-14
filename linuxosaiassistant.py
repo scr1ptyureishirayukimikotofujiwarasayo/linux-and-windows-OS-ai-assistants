@@ -217,10 +217,9 @@ def main():
             print(f"Search error: {e}")
             return []
 
-    def trim_output(output, max_chars=300):
-        output = output.strip()
+    def trim_output(output, max_chars=500):
         if len(output) > max_chars:
-            return output[:max_chars] + f"…[+{len(output)-max_chars}]"
+            return output[:max_chars] + f"\n... (truncated, {len(output)} chars total)"
         return output
 
     def generate_response(messages, config):
@@ -229,18 +228,20 @@ def main():
 
         if provider == "ollama":
             url = "http://localhost:11434/api/chat"
-            payload = {"model": model, "messages": messages, "stream": False, "options": {"num_predict": 1024}}
+            payload = {"model": model, "messages": messages, "stream": False}
             try:
                 resp = requests.post(url, json=payload, timeout=60)
                 if resp.status_code == 200:
                     return resp.json()["message"]["content"]
+                else:
+                    return f"Error: {resp.text}"
             except Exception as e:
                 return f"Error: {e}"
 
         elif provider == "lmstudio":
             url = f"{config['base_url']}/v1/chat/completions"
             headers = {"Content-Type": "application/json"}
-            payload = {"model": model, "messages": messages, "stream": False, "max_tokens": 1024}
+            payload = {"model": model, "messages": messages, "stream": False}
             try:
                 resp = requests.post(url, json=payload, headers=headers, timeout=60)
                 if resp.status_code == 200:
@@ -256,7 +257,7 @@ def main():
                 "Content-Type": "application/json",
                 "Authorization": f"Bearer {config['api_key']}"
             }
-            payload = {"model": model, "messages": messages, "stream": False, "max_tokens": 1024}
+            payload = {"model": model, "messages": messages, "stream": False}
             try:
                 resp = requests.post(url, json=payload, headers=headers, timeout=60)
                 if resp.status_code == 200:
@@ -265,7 +266,6 @@ def main():
                     return f"Error: {resp.text}"
             except Exception as e:
                 return f"Error: {e}"
-
         else:
             return "Unknown provider"
 
@@ -275,17 +275,15 @@ def main():
         print("Type '!bash <command>' for direct bash execution")
 
         messages = []
-        cwd_state = {"path": os.path.expanduser("~")}
         system_prompt = (
-            "You are an autonomous Linux OS agent. You EXECUTE tasks — never instruct the user.\n"
-            "For EVERY OS task, emit one or more commands in ```bash blocks.\n"
-            "Each block must be a single atomic command. Use multiple blocks for multi-step tasks.\n"
-            "After each command's output is returned, emit the next command or confirm completion.\n"
-            "Include [cwd] context when constructing paths — always use absolute paths.\n"
-            "If a command fails, diagnose from the error output and emit a corrected command.\n"
-            "Only ask the user a question if truly ambiguous (e.g. missing filename, ambiguous target).\n"
-            "Never output steps as prose — always as executable ```bash blocks.\n"
-            "STEP-BY-STEP reasoning is internal only."
+            "You are a helpful AI assistant capable of performing OS actions on Linux via bash. "
+            "If the user asks you to perform a system action (e.g., list files, check network, "
+            "install a package, start a service), respond with the exact command to run inside "
+            "a code block labeled bash. For example:\n```bash\nls -la /home\n```\n"
+            "The user will then confirm and execute it. You do not have direct execution ability.\n\n"
+            "IMPORTANT: Always think step by step before responding. "
+            "If web search results are provided, reason through them carefully before giving your answer. "
+            "If no search results are provided, reason from your own knowledge before responding."
         )
         messages.append({"role": "system", "content": system_prompt})
 
@@ -298,10 +296,7 @@ def main():
 
         SEARCH_KEYWORDS = ["what is", "how to", "latest", "news", "who is",
                            "why", "explain", "when did", "where is", "current",
-                           "update", "version", "download", "install", "error", "fix", "broken"]
-        OS_ACTION_KEYWORDS = ["open", "run", "start", "kill", "delete", "list", "find",
-                              "move", "copy", "rename", "create", "install", "uninstall",
-                              "check", "disable", "enable", "schedule", "read", "write"]
+                           "update", "version", "download", "install"]
 
         MAX_TURNS = 20
 
@@ -323,8 +318,11 @@ def main():
                 print(f"Searching for: {query}")
                 results = web_search(query)
                 if results:
-                    search_context = "\n".join([f"- {r['body'][:120]} ({r['href']})" for r in results[:2]])
-                    user_input = f"Search:'{query}':\n{search_context}\nAnswer concisely."
+                    search_context = "\n".join([f"- {r['body']} (source: {r['href']})" for r in results])
+                    user_input = (
+                        f"Web search results for '{query}':\n{search_context}\n\n"
+                        f"Think step by step through the search results carefully before answering."
+                    )
                 else:
                     user_input = f"I tried to search for '{query}' but got no results. Please answer as best you can."
 
@@ -334,7 +332,7 @@ def main():
                 if confirm_action(cmd):
                     output, success = run_os_command(cmd, config.get("use_sudo", False))
                     print(f"\nBash Output:\n{output}")
-                    messages.append({"role": "user", "content": f"[bash:{cmd[:40]}]\n{trim_output(output)}"})
+                    messages.append({"role": "user", "content": f"Executed bash command: {cmd}\nOutput: {trim_output(output)}"})
                     response = generate_response(messages, config)
                     print(f"\nAssistant: {response}")
                     messages.append({"role": "assistant", "content": response})
@@ -345,74 +343,48 @@ def main():
             else:
                 # Auto-search if enabled, internet available, and query matches keywords
                 if auto_search and internet_available:
-                    is_os_action = any(kw in user_input.lower() for kw in OS_ACTION_KEYWORDS)
-                    should_search = not is_os_action and any(kw in user_input.lower() for kw in SEARCH_KEYWORDS)
+                    should_search = any(kw in user_input.lower() for kw in SEARCH_KEYWORDS)
                     if should_search:
                         print("(Searching web for context...)")
                         results = web_search(user_input)
                         if results:
-                            search_context = "\n".join([f"- {r['body'][:100]}" for r in results[:2]])
-                            user_input = f"[Search]\n{search_context}\nQ:{user_input}"
+                            search_context = "\n".join([f"- {r['body']} (source: {r['href']})" for r in results])
+                            user_input = (
+                                f"Web search results:\n{search_context}\n\n"
+                                f"User question: {user_input}\n\n"
+                                f"Think step by step through the search results carefully before answering."
+                            )
                         else:
                             print("No search results found.")
 
-            enriched_input = f"[cwd: {cwd_state['path']}]\n{user_input}"
-            messages.append({"role": "user", "content": enriched_input})
+            messages.append({"role": "user", "content": user_input})
 
             # Periodic system prompt reminder
-            if len(messages) % 8 == 0 and len(messages) > 1:
-                messages.append({"role": "user", "content": "[Sys] Be autonomous. Always use ```bash blocks. Never instruct user to run commands."})
+            if len(messages) % 10 == 0 and len(messages) > 1:
+                messages.append({"role": "user", "content": f"[System] Reminder of your instructions: {system_prompt}"})
 
             # Trim context before generating response
             if len(messages) > 1 + (MAX_TURNS * 2):
-                dropped = messages[1:-(MAX_TURNS * 2)]
-                summary_content = "[System] Context trimmed. Prior actions: " + "; ".join(
-                    m["content"][:80].replace("\n", " ") for m in dropped if m["role"] == "assistant"
-                )
-                messages = [messages[0], {"role": "user", "content": summary_content}] + messages[-(MAX_TURNS * 2):]
+                messages = [messages[0]] + messages[-(MAX_TURNS * 2):]
 
             print("Assistant is thinking...")
             response = generate_response(messages, config)
             print(f"\nAssistant: {response}")
             messages.append({"role": "assistant", "content": response})
 
-            if len(messages) > 10:
-                for i in range(1, len(messages) - 6):
-                    if messages[i]["role"] == "assistant" and len(messages[i]["content"]) > 60:
-                        messages[i]["content"] = messages[i]["content"][:60] + "…"
-
-            def extract_and_run_commands(response, messages, config, depth=0, max_depth=5):
-                if depth >= max_depth:
-                    return messages
-                bash_blocks = re.findall(r'```bash\n(.*?)\n```', response, re.DOTALL | re.IGNORECASE)
-                sh_blocks = re.findall(r'```sh\n(.*?)\n```', response, re.DOTALL | re.IGNORECASE)
-                all_commands = [c.strip() for c in bash_blocks + sh_blocks]
-                if not all_commands:
-                    return messages
-                for cmd in all_commands:
-                    print(f"\nAssistant proposes (bash):\n{cmd}")
-                    if confirm_action(cmd):
-                        output, success = run_os_command(cmd, config.get("use_sudo", False), cwd=cwd_state["path"])
-                        print(f"\n[bash output]\n{output}")
-                        cd_match = re.match(r'^cd\s+"?(.+?)"?\s*$', cmd)
-                        if cd_match and success:
-                            new_path = cd_match.group(1).strip()
-                            if os.path.isabs(new_path):
-                                cwd_state["path"] = new_path
-                            else:
-                                cwd_state["path"] = os.path.normpath(os.path.join(cwd_state["path"], new_path))
-                        messages.append({"role": "user", "content": f"[out:{success}]\n{trim_output(output)}"})
-                        if not success:
-                            messages.append({"role": "user", "content": "[System] Last command FAILED. Diagnose and emit a corrected bash command."})
-                        follow_up = generate_response(messages, config)
-                        print(f"\nAssistant: {follow_up}")
-                        messages.append({"role": "assistant", "content": follow_up})
-                        messages = extract_and_run_commands(follow_up, messages, config, depth + 1, max_depth)
-                    else:
-                        messages.append({"role": "user", "content": f"[System] User declined: {cmd[:60]}"})
-                return messages
-
-            messages = extract_and_run_commands(response, messages, config)
+            # Extract and run all bash commands from response
+            bash_matches = re.findall(r'```bash\n(.*?)\n```', response, re.DOTALL | re.IGNORECASE)
+            for cmd in bash_matches:
+                cmd = cmd.strip()
+                print(f"\nAssistant proposes bash command:\n{cmd}")
+                if confirm_action(cmd):
+                    output, success = run_os_command(cmd, config.get("use_sudo", False))
+                    messages.append({"role": "user", "content": f"[System] Command output:\n{trim_output(output)}"})
+                    response = generate_response(messages, config)
+                    print(f"\nAssistant: {response}")
+                    messages.append({"role": "assistant", "content": response})
+                else:
+                    messages.append({"role": "user", "content": "[System] User declined to execute the command."})
 
     # Start the chat
     chat_loop(config)
